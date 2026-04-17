@@ -2,9 +2,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
 import os
 
 torch.manual_seed(42)
@@ -37,24 +39,31 @@ def sample_ring(n, radius=1.0, width=0.3):
     return np.column_stack([x, y])
 
 
-def train_model(D, d, pred_type, hidden_dim=256, epochs=5000, batch_size=512, lr=2e-4):
-    P = torch.randn(D, d)
+def train_model(D, d, pred_type, hidden_dim=256, epochs=5000, batch_size=512, lr=2e-4, device=None, save_dir='./toy_results'):
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    P = torch.randn(D, d, device=device)
     P, _ = torch.linalg.qr(P)
 
-    model = Generator(D + 1, hidden_dim, D)
+    model = Generator(D + 1, hidden_dim, D).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    print(f"  Training {pred_type} for D={D}...")
+    print(f"  Training {pred_type} for D={D} on {device}...")
+
+    os.makedirs(save_dir, exist_ok=True)
+    best_loss = float('inf')
+    best_model_state = None
 
     for epoch in range(epochs):
         model.train()
 
-        t = torch.rand(batch_size).clamp(0.01, 0.99)
+        t = torch.rand(batch_size, device=device).clamp(0.01, 0.99)
 
-        x_hat = torch.from_numpy(sample_ring(batch_size, radius=1.0, width=0.3)).float()
+        x_hat = torch.from_numpy(sample_ring(batch_size, radius=1.0, width=0.3)).float().to(device)
         x = x_hat @ P.T
-        eps = torch.randn(batch_size, D)
+        eps = torch.randn(batch_size, D, device=device)
         z_t = t.view(-1, 1) * x + (1 - t.view(-1, 1)) * eps
 
         v_target = x - eps
@@ -76,17 +85,37 @@ def train_model(D, d, pred_type, hidden_dim=256, epochs=5000, batch_size=512, lr
         optimizer.step()
         scheduler.step()
 
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            best_model_state = model.state_dict().copy()
+
         if (epoch + 1) % 1000 == 0:
             print(f"    Epoch {epoch + 1}: loss={loss.item():.4f}")
 
+    # Save best model
+    save_path = os.path.join(save_dir, f'model_D{D}_{pred_type}.pt')
+    torch.save({
+        'model_state_dict': best_model_state,
+        'P': P.cpu(),
+        'D': D,
+        'd': d,
+        'pred_type': pred_type,
+        'best_loss': best_loss
+    }, save_path)
+    print(f"    Saved model: {save_path}")
+
+    model.load_state_dict(best_model_state)
     return model, P
 
 
-def sample_heun(model, D, pred_type, num_samples=2000, num_steps=50):
+def sample_heun(model, D, pred_type, num_samples=2000, num_steps=50, device=None):
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     model.eval()
 
     with torch.no_grad():
-        z = torch.randn(num_samples, D)
+        z = torch.randn(num_samples, D, device=device)
 
         dt = 1.0 / num_steps
 
@@ -96,7 +125,7 @@ def sample_heun(model, D, pred_type, num_samples=2000, num_steps=50):
                 break
             t_next = t_cur + dt
 
-            t_batch = torch.full((num_samples,), t_cur)
+            t_batch = torch.full((num_samples,), t_cur, device=device)
             output1 = model(z, t_batch)
 
             if pred_type == 'x':
@@ -113,7 +142,7 @@ def sample_heun(model, D, pred_type, num_samples=2000, num_steps=50):
             z_next = z + dt * v_pred1
 
             t_next_c = min(t_next, 0.999)
-            t_batch2 = torch.full((num_samples,), t_next_c)
+            t_batch2 = torch.full((num_samples,), t_next_c, device=device)
             output2 = model(z_next, t_batch2)
 
             if pred_type == 'x':
@@ -142,8 +171,12 @@ def plot_kde_or_scatter(ax, data_2d, color, axis_lim=2.5, is_gt=False):
                 fontsize=14, color='gray')
         return
 
+    # Try KDE with numpy 1.x compatible scipy
     try:
+        import scipy
         from scipy.stats import gaussian_kde
+        if int(scipy.__version__.split('.')[0]) >= 1 and int(scipy.__version__.split('.')[1]) >= 10:
+            raise ImportError("scipy version not compatible")
         xy = np.vstack([data_2d[:, 0], data_2d[:, 1]])
         kde = gaussian_kde(xy, bw_method=0.15)
 
@@ -157,8 +190,9 @@ def plot_kde_or_scatter(ax, data_2d, color, axis_lim=2.5, is_gt=False):
         ax.contour(X, Y, Z, levels=8, colors='#2ca02c' if is_gt else color,
                    linewidths=0.5, alpha=0.6)
     except Exception:
+        # Fallback to scatter with density coloring
         ax.scatter(data_2d[:, 0], data_2d[:, 1],
-                   s=3, alpha=0.5, c=color, edgecolors='none')
+                   s=8, alpha=0.6, c=color, edgecolors='none')
 
     ax.set_xlim(-axis_lim, axis_lim)
     ax.set_ylim(-axis_lim, axis_lim)
@@ -169,6 +203,9 @@ def main():
     print("=" * 60)
     print("Figure 2 - Matching Paper Setup")
     print("=" * 60)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
 
     os.makedirs('./toy_results', exist_ok=True)
 
@@ -194,9 +231,9 @@ def main():
         D_P.append(None)
 
         for pred_type in prediction_types:
-            model, P = train_model(D, d, pred_type, epochs=5000)
-            z_final = sample_heun(model, D, pred_type, num_samples=num_samples, num_steps=50)
-            samples_d = (z_final @ P).numpy()
+            model, P = train_model(D, d, pred_type, epochs=5000, device=device)
+            z_final = sample_heun(model, D, pred_type, num_samples=num_samples, num_steps=50, device=device)
+            samples_d = (z_final @ P).cpu().numpy()
             D_results.append(samples_d)
             D_P.append(P)
 
@@ -233,8 +270,7 @@ def main():
             if di > 0:
                 ax.set_yticklabels([])
 
-    plt.tight_layout(pad=0.8)
-    plt.savefig('./toy_results/figure_2_kde.png', dpi=200, bbox_inches='tight', facecolor='white')
+    plt.savefig('./toy_results/figure_2_kde.png', dpi=200, facecolor='white')
     plt.close()
     print("Saved: ./toy_results/figure_2_kde.png")
 
@@ -277,8 +313,7 @@ def main():
             if di > 0:
                 ax.set_yticklabels([])
 
-    plt.tight_layout(pad=0.8)
-    plt.savefig('./toy_results/figure_2_scatter.png', dpi=200, bbox_inches='tight', facecolor='white')
+    plt.savefig('./toy_results/figure_2_scatter.png', dpi=200, facecolor='white')
     plt.close()
     print("Saved: ./toy_results/figure_2_scatter.png")
 
